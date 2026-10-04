@@ -208,6 +208,90 @@ static inline int is_separator(char c)
     return c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
+static uint32_t tokenize_piece(const BPE* bpe, token_t* piece, uint32_t len)
+{
+    for (uint32_t m = 0; m < bpe->n_merges && len > 1; m++)     // same order as fit
+        len = merge_pair_in_seq(piece, len, bpe->merges[m].left, bpe->merges[m].right,
+                                (token_t)(256 + m));
+    return len;
+}
+
+static size_t pretokenize(const uint8_t* text, size_t len, Span* spans)
+{
+    size_t n = 0, i = 0;
+    while (i < len)
+    {
+        size_t start = i;
+        if (text[i] == ' ' && i + 1 < len && !is_separator(text[i + 1]))
+        {
+            i++;
+            while (i < len && !is_separator(text[i]))
+                i++;
+        }
+        else if (is_separator(text[i]))
+        {
+            while (i < len && is_separator(text[i]))
+            {
+                if (text[i] == ' ' && i + 1 < len && !is_separator(text[i + 1]))
+                    break;
+                i++;
+            }
+        }
+        else
+        {
+            while (i < len && !is_separator(text[i]))
+                i++;
+        }
+        spans[n++] = (Span){(uint32_t)start, (uint32_t)(i - start), 0};
+    }
+    return n;
+}
+
+/**
+ * O(len * n_merges): encodes text into out, which must hold at least strlen(text) tokens, and
+ * describes its pieces in spans (at least strlen(text) entries).
+ * 1. out gets one token per byte, pretokenize splits the text into spans
+ * 2. every piece is merged in place inside its own slice out[start .. start+len)
+ * 3. compaction: the slices are moved one after the other, closing the gaps left by the merges
+ * Returns the number of tokens, stored in out[0 .. return).
+ */
+size_t tokenize(const char* text, token_t* out, BPE* bpe_state, Span* out_spans)
+{
+    const uint8_t* s   = (const uint8_t*)text; // unsigned: bytes >= 128 stay positive
+    size_t       len = strlen(text);
+
+    // Copy into out the starting tokens corresponding to the base characters
+    for (size_t i = 0; i < len; i++)
+        out[i] = s[i];
+
+    size_t n_spans = pretokenize(s, len, out_spans);
+
+    for (size_t i = 0; i < n_spans; i++)
+    {
+        out_spans[i].n_tok = tokenize_piece(bpe_state, out + out_spans[i].start, out_spans[i].len);
+    }
+
+    // compaction: w is where the next piece goes. w <= start always (every piece wrote at most
+    // len tokens), so the move only goes backwards and never overwrites a piece not moved yet;
+    // memmove because source and destination may overlap
+    size_t w = 0;
+    for (size_t i = 0; i < n_spans; i++)
+    {
+        memmove(out + w, out + out_spans[i].start, out_spans[i].n_tok * sizeof(token_t));
+        w += out_spans[i].n_tok;
+    }
+    return w;
+}
+
+/**
+ * Decodes n tokens into a NUL terminated string in out (cap bytes, terminator included).
+ * Returns the string length, or SIZE_MAX if out is too small or a token id is unknown.
+ */
+size_t detokenize(const token_t* tokens, size_t n, char* out, size_t cap, BPE* bpe_state)
+{
+}
+
+
 /**
  * For parsing words from the given file, we need to map it into memory,
  * for performance reasons instead of classic read/write api that doeas too many ctx-switches.
