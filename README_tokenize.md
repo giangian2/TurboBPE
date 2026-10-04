@@ -1,8 +1,9 @@
 # Tokenize: architecture
 
-> Status: implemented, single threaded, merges replayed in training order (O(len × n_merges)).
-> The faster algorithm and the parallel version plug into this same structure, see
-> [README.md](README.md#roadmap).
+> Status: implemented, merges replayed in training order (O(len × n_merges)). One call runs on
+> the calling thread; concurrency comes from the caller (see
+> [README.md](README.md#3-production-use-from-python)). The faster algorithm plugs into this
+> same structure.
 
 ## The key invariant
 
@@ -19,7 +20,7 @@ replaces two tokens with one. Sequences only shrink. Everything below relies on 
 | `Span` | describes one word (piece) | where it is + how many tokens it produced |
 | `tokenize_piece` | one word | the tokens of that word |
 
-The unit of work, and later the unit of parallelism, is the **word**. Tokens are the result.
+The unit of work is the **word**. Tokens are the result.
 
 ## Memory: no allocation inside tokenize
 
@@ -89,7 +90,7 @@ for (size_t i = 0; i < len; i++)                   // 1. one token per byte, spl
     out[i] = s[i];
 size_t n_spans = pretokenize(s, len, spans);
 
-for (size_t i = 0; i < n_spans; i++)               // 2. later: one task per block of spans
+for (size_t i = 0; i < n_spans; i++)               // 2. every piece on its own
     spans[i].n_tok = tokenize_piece(bpe, out + spans[i].start, spans[i].len);
 
 size_t w = 0;                                      // 3. compaction: close the gaps
@@ -101,8 +102,8 @@ return w;
 ```
 
 1. **Split** the text into spans, with `out` holding the byte tokens.
-2. **Tokenize** each span inside its own slice of `out`. Independent work, the parallel part.
-3. **Compact**: sequential O(n) pass after the barrier. `memmove` is safe because
+2. **Tokenize** each span inside its own slice of `out`. Pieces are independent of each other.
+3. **Compact**: one O(n) pass. `memmove` is safe because
    `w <= spans[i].start` always.
 
 ## Example: `"il fuggiasco"`
@@ -138,7 +139,6 @@ frequencies matter there), so no merge ever involves them and they always stay b
 
 | Feature | Where it plugs in |
 |---|---|
-| coroutines + POSIX thread pool | phase 2: one task per **block** of spans (one per word is too fine grained), barrier before phase 3 |
 | hashmap `(a,b) -> rank` | field in `BPE`, built at the end of `fit` and after `bpe_load`, read in `tokenize_piece` |
-| heap ordered by rank | inside `tokenize_piece`: one buffer per thread, never one allocation per word |
-| word -> tokens cache | the only shared mutable state: per-thread, or protected |
+| heap ordered by rank | inside `tokenize_piece`: one buffer per calling thread, never one allocation per word |
+| word -> tokens cache | in front of `tokenize_piece`, per calling thread so it needs no lock |

@@ -44,7 +44,7 @@ make memcheck                # valgrind --leak-check=full
 | `src/bpe.c` | corpus parser, training (`init`, `fit`), `tokenize`, model save/load |
 | `src/main.c` | CLI: `train`, `live` |
 | `include/gian_arena.h` | linear arena with aligned allocations (used by `live`) |
-| `include/hashmap.h` | generic open addressing hashmap (for the rank map) |
+| `include/hashmap.h` | generic open addressing hashmap (rank map, word counts) |
 | `include/heap.h` | generic binary heap with a user comparator (for the merge queue) |
 | `include/arena.h` | vendored arena by Alexey Kutepov (MIT) |
 | `README_tokenize.md` | how `tokenize` works: spans, in-place pieces, compaction |
@@ -74,14 +74,16 @@ children are not older tokens (that would break the DAG).
 | `detokenize` | 🚧 stub | declared, not implemented |
 | Streaming detokenize | 📋 planned | [see below](#1-streaming-detokenize) |
 | Rank hashmap + heap tokenize | 📋 planned | [see below](#2-tokenize-with-a-rank-hashmap--heap) |
-| Multithreading with coroutines | 📋 planned | [see below](#3-multithreading-with-a-thread-pool-and-coroutines) |
+| Thread-safe encode API | 📋 planned | explicit length, `const` model, [see below](#3-production-use-from-python) |
+| Python binding | 📋 planned | `.so` + ctypes, GIL released, tokens returned as a `uint16` buffer |
 | Word -> tokens cache | 📋 planned | per-thread, in front of `tokenize_piece` |
-| Faster training | 📋 planned | `init` dedup is O(n²), `fit` recounts every pair at each merge |
+| Training on large corpora | 📋 planned | count unique words instead of keeping every occurrence, [see below](#4-training-on-large-corpora) |
 
 ### Known limitations
 
 - `init` finds duplicate words with a linear search: O(n²) in the number of distinct words.
 - `fit` recounts all pairs after every merge: O(n_ids + PAIR_CAP) per merge.
+- Training keeps every word occurrence in memory, so the corpus size is bounded by RAM.
 - `tokenize` replays every merge on every piece: O(len × n_merges).
 - Whitespace-only pieces are never seen by training, so they always stay byte tokens.
 - `VOCAB_SIZE` is a compile-time constant; the model file is in native endianness.
@@ -160,53 +162,80 @@ while k > 1:
   pushed), merge, push the new pairs it forms with its left and right neighbours;
 - finally walk the list and write the tokens back to `piece[0..n_tok)`.
 
-The heap and the list arrays are per-thread scratch, reused with `heap_clear`: never one
-allocation per word. Short pieces (the large majority) keep the simple version, which is faster
+The heap and the list arrays are per-thread scratch (each calling thread has its own), reused
+with `heap_clear`: never one allocation per word. Short pieces (the large majority) keep the simple version, which is faster
 below a few dozen tokens.
 
 **Correctness check.** Both versions must produce exactly the tokens of the current merge replay
 on the whole corpus; the replay stays in the code as the reference.
 
-### 3. Multithreading with a thread pool and coroutines
+### 3. Production use from Python
 
-Spans are independent: span `i` reads only `text[start .. start+len)` and writes only
-`out[start .. start+len)`, and the model is read-only. Phase 2 of `tokenize` needs no lock.
+The library is meant to be called from Python: compiled as a `.so`, loaded with `ctypes` (or a
+C extension later). There is **no parallelism inside the library**: no thread pool, no
+coroutines, no batch API. Each call tokenizes one text on the thread that makes it, and the
+concurrency belongs to the caller.
 
-**Threads for CPU parallelism.** A pool of POSIX threads, one per core, created once.
+**Why no internal parallelism.**
 
-- The unit of work is a **block of spans** (for example ~64 KB of text), not a single word: a
-  word is far too small to pay for scheduling.
-- Each thread owns its scratch (its own arena, heap and linked list buffers, word cache), so
-  `ARENA_THREAD_SAFE` is not needed and nothing is shared but the read-only model.
-- Compaction after the barrier can be parallel too: each block counts its tokens, an exclusive
-  prefix sum over the counts gives each block its destination offset, and every block moves its
-  tokens there independently.
+- A prompt is a few KB and tokenizes in microseconds: splitting it across threads would cost
+  more than it saves.
+- On Linux a Python `threading.Thread` is a POSIX thread. An inference server that tokenizes
+  many requests at once is already calling the library from many threads in parallel.
+- Bulk work (tokenizing a whole dataset before training, indexing documents) parallelizes
+  across **documents**, which are already independent. The caller does it with its own pool,
+  as tiktoken does:
 
-**Coroutines for the pipeline.** When the text arrives as a stream (a large file, stdin, a
-socket), the work becomes three stages:
+  ```python
+  with ThreadPoolExecutor(8) as ex:
+      ids = list(ex.map(tok.encode, texts))
+  ```
 
+**What the library must guarantee instead.**
+
+- **Reentrant.** Any number of threads may call `encode` at the same time: the model is
+  read-only, the buffers belong to the caller, no global state is touched (the static pair
+  table in `bpe.c` is used by training only).
+- **The GIL is released during the call**, otherwise Python runs one thread at a time.
+  `ctypes` does it automatically; a C extension wraps the call in
+  `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS` and touches no Python object meanwhile.
+
+**API changes this needs.**
+
+```c
+// explicit length: a Python bytes object may contain \0; const model: shared by every thread
+size_t bpe_encode(const BPE* bpe, const uint8_t* text, size_t len, token_t* out, Span* scratch);
+size_t bpe_decode(const BPE* bpe, const token_t* tokens, size_t n, char* out, size_t cap);
 ```
-reader  ──chunks──▶  tokenizer workers  ──blocks of tokens──▶  writer
-```
 
-- **reader**: reads a chunk and splits it into spans; the last piece may continue in the next
-  chunk, so it is held back until a separator arrives (a space starts the next word, so the
-  previous one is complete);
-- **workers**: tokenize blocks of spans on the thread pool;
-- **writer**: emits blocks **in order** with a `next` index, even if block 5 finishes before
-  block 2 (the same reordering idea as TCP).
+- Scratch (`out`, `spans`) can come from a per-thread arena (`_Thread_local`), so a call does
+  not `malloc`.
+- Tokens go back to Python as one `uint16` buffer (a NumPy array or `bytes`), never as a list
+  of Python `int` objects: building that list costs more than the tokenization itself.
 
-Coroutines (stackful, e.g. `ucontext`, or a hand-written state machine) let the reader and the
-writer suspend while waiting for I/O or for the next block in order, without blocking a thread:
-many coroutines are multiplexed on few threads (M:N), threads give the parallelism, coroutines
-give the cooperative scheduling between stages.
+### 4. Training on large corpora
 
-### 4. Smaller items
+`mmap` is not the limit: it works with files larger than RAM, the kernel pages them in and out
+(`madvise(MADV_SEQUENTIAL)` helps). The limit is that `parse_training_corpus` copies **every
+occurrence** of every word into the pool, and `init` deduplicates them in O(n²).
+
+Training only needs the **unique words with their counts**: `fit` already works on `Word`
+entries with a `count` field. The number of unique words grows far slower than the corpus, so:
+
+1. **Count in chunks.** Read the corpus a chunk at a time and update a `word -> count` hashmap
+   (`hashmap.h`). A word cut at the end of a chunk is carried over to the next one.
+2. **Build `words[]` and `ids[]`** from the unique words only, with no O(n²) search.
+3. **Run `fit` unchanged**, on data that fits in memory whatever the corpus size.
+
+If even the unique words are too many, the rarest ones are dropped: they barely affect the
+merges. Hugging Face tokenizers and SentencePiece train the same way.
+
+### 5. Smaller items
 
 - **Word -> tokens cache** in front of `tokenize_piece`: frequent words (`" il"`, `" di"`) are
   tokenized once and then copied. Per-thread, so it needs no lock.
-- **Faster training**: a hashmap for the word dedup in `init`; in `fit`, update the pair counts
-  incrementally around each merge instead of recounting everything.
+- **Incremental pair counts in `fit`**: update the counts around each merge instead of
+  recounting every pair.
 - **Learn whitespace too**: let training see the whitespace pieces so that runs like `"\n\n"`
   or indentation get their own tokens.
 
