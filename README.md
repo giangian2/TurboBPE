@@ -13,8 +13,8 @@ The goal is a tokenizer fast enough for training datasets, built step by step an
 ## Build and run
 
 ```sh
-make                         # bin/libbpe.a + bin/main, -O0 -g (easy to step through)
-make OPT=-O2                 # optimized build, for profiling and measuring
+make                         # bin/libbpe.a + bin/libbpe.so + bin/main, -O0 -g (easy to step through)
+make OPT=-O2                 # optimized build
 
 ./bin/main train test.txt out/model.bpe     # learn the merges, save the model
 ./bin/main live out/model.bpe               # type a line + Enter, Ctrl+D to quit
@@ -36,6 +36,40 @@ make debug                   # gdb with the layout in gdb/init.gdb
 make memcheck                # valgrind --leak-check=full
 ```
 
+Benchmark and profile of `tokenize` (`bin/bench` is always built with `-O2 -g`, whatever `OPT` is):
+
+```sh
+make bench                   # time tokenize without and with the word cache, check same tokens
+make profile                 # callgrind, cost per function (full data in build/callgrind.out)
+make bench BENCH_MODEL=out/model2.bpe BENCH_TEXT=test2.txt BENCH_SIZE=10000000
+```
+
+```
+307 merges, 2001742 bytes -> 662316 tokens (3.02 bytes/token)
+no cache:      56.68 ms,    35.3 MB/s
+word cache:    18.43 ms,   108.6 MB/s  (3.1x)
+```
+
+The text is a small file repeated up to `BENCH_SIZE`: caches are as warm as they get and almost
+every piece is a cache hit, so read the numbers as an upper bound. A large, varied corpus gives
+the real figure.
+
+### From Python
+
+`bin/libbpe.so` is loaded with `ctypes` by `python/turbo_bpe.py` (rebuild it with `make` after
+changing the C code):
+
+```python
+import sys; sys.path.insert(0, "python")
+from turbo_bpe import Tokenizer
+
+with Tokenizer("out/model.bpe") as tok:
+    ids = tok.encode("il fuggiasco")   # array('H', [458, 275, 491, 105, 291, 99, 111])
+```
+
+`ctypes` releases the GIL during the C call, so `encode` can be called from many threads at once
+(`ThreadPoolExecutor`): the model is shared read-only, every thread gets its own word cache.
+
 ## Layout
 
 | Path | Content |
@@ -43,10 +77,11 @@ make memcheck                # valgrind --leak-check=full
 | `include/turbo_bpe.h` | public API, `BPE` model, `Span`, `Word`, tuning constants |
 | `src/bpe.c` | corpus parser, training (`init`, `fit`), `tokenize`, model save/load |
 | `src/main.c` | CLI: `train`, `live` |
+| `src/bench.c` | benchmark of `tokenize`, without and with the word cache (`make bench`, `make profile`) |
+| `python/turbo_bpe.py` | `ctypes` wrapper around `bin/libbpe.so`: `Tokenizer(model).encode(text)` |
 | `include/gian_arena.h` | linear arena with aligned allocations (used by `live`) |
-| `include/hashmap.h` | generic open addressing hashmap (rank map, word counts) |
+| `include/hashmap.h` | generic open addressing hashmap (merge map, word cache) |
 | `include/heap.h` | generic binary heap with a user comparator (for the merge queue) |
-| `include/arena.h` | vendored arena by Alexey Kutepov (MIT) |
 | `README_tokenize.md` | how `tokenize` works: spans, in-place pieces, compaction |
 
 ## Model file
@@ -60,6 +95,26 @@ merges[n_merges]            { uint16 left, uint16 right }, token 256 + i = merge
 Native endianness. `bpe_load` rejects a wrong magic, too many merges, and any merge whose
 children are not older tokens (that would break the DAG).
 
+## Word cache
+
+`tokenize_piece` is the expensive part, and its result depends only on the bytes of the piece:
+`" the"` always gives the same tokens. Natural text repeats the same words all the time, so the
+first time a piece is seen its tokens are stored, and the next times they are copied.
+
+- **What it is.** A `hashmap.h` table of `CacheEntry`: key = the piece bytes (zero padded) and
+  their length, value = the tokens. Pieces longer than `CACHE_MAX_LEN` bytes skip the cache (rare,
+  seldom repeated), so every entry has a fixed size and lives entirely in its slot: one lookup,
+  one cache line, no second allocation. `CACHE_CAP` slots, about 1.5 MB.
+- **Who owns it.** It must remember words across calls, so it cannot live inside `tokenize`: the
+  caller creates it with `bpe_cache_create` and passes it to every call (`NULL` = no cache).
+  `tokenize` writes to it, so it is **one per thread**; the `BPE` is read-only and shared.
+- **When it is full.** At half capacity it is emptied (`hash_table_clear`) and refilled: linear
+  probing stays fast, and the frequent words come back after a few lines.
+- **Cost.** A hit is one lookup + `memcpy` instead of every merge step of the piece (each with one
+  merge map lookup per pair); a miss costs one extra lookup and one insert.
+
+In `live` the cache lives for the whole session, apart from the arena that is reset at every line.
+
 ## Status
 
 | Area | State | Notes |
@@ -68,15 +123,16 @@ children are not older tokens (that would break the DAG).
 | Training (`init` + `fit`) | ✅ done | dedup of repeated words, most frequent pair merged until `VOCAB_SIZE` / `MERGES_THRESHOLD` |
 | Model save / load | ✅ done | validated on load |
 | `pretokenize` | ✅ done | every byte in exactly one span, same rule as training |
-| `tokenize` | ✅ done | per-piece merge replay in place + compaction, no allocation |
+| `tokenize` | ✅ done | per piece: lowest-rank adjacent pair via the merge map, in place + compaction, no allocation |
+| Word -> tokens cache | ✅ done | caller-owned, one per thread, [see above](#word-cache) |
+| Benchmark / profile | ✅ done | `make bench`, `make profile` |
 | CLI `train` / `live` | ✅ done | `live` uses one arena reset per line |
 | Arena | ✅ done | 8 byte aligned allocations, single-TU implementation |
 | `detokenize` | 🚧 stub | declared, not implemented |
 | Streaming detokenize | 📋 planned | [see below](#1-streaming-detokenize) |
-| Rank hashmap + heap tokenize | 📋 planned | [see below](#2-tokenize-with-a-rank-hashmap--heap) |
+| Rank hashmap + heap tokenize | 🚧 partial | merge map done (simple version), heap planned, [see below](#2-tokenize-with-a-rank-hashmap--heap) |
 | Thread-safe encode API | 📋 planned | explicit length, `const` model, [see below](#3-production-use-from-python) |
-| Python binding | 📋 planned | `.so` + ctypes, GIL released, tokens returned as a `uint16` buffer |
-| Word -> tokens cache | 📋 planned | per-thread, in front of `tokenize_piece` |
+| Python binding | ✅ done | `bin/libbpe.so` + `python/turbo_bpe.py` (ctypes), GIL released, tokens as `array('H')` |
 | Training on large corpora | 📋 planned | count unique words instead of keeping every occurrence, [see below](#4-training-on-large-corpora) |
 
 ### Known limitations
@@ -84,7 +140,10 @@ children are not older tokens (that would break the DAG).
 - `init` finds duplicate words with a linear search: O(n²) in the number of distinct words.
 - `fit` recounts all pairs after every merge: O(n_ids + PAIR_CAP) per merge.
 - Training keeps every word occurrence in memory, so the corpus size is bounded by RAM.
-- `tokenize` replays every merge on every piece: O(len × n_merges).
+- `tokenize_piece` looks up every adjacent pair again after each merge: O(len²) merge map lookups
+  per piece (cache misses only).
+- The merge map has a fixed capacity (`2 * VOCAB_SIZE` slots, no rehash), but `bpe_load` accepts
+  up to `MAX_MERGES`: a model with more merges than that would not fit the map.
 - Whitespace-only pieces are never seen by training, so they always stay byte tokens.
 - `VOCAB_SIZE` is a compile-time constant; the model file is in native endianness.
 - `tokenize` takes a NUL terminated string, so the text cannot contain `\0` bytes.
@@ -232,8 +291,6 @@ merges. Hugging Face tokenizers and SentencePiece train the same way.
 
 ### 5. Smaller items
 
-- **Word -> tokens cache** in front of `tokenize_piece`: frequent words (`" il"`, `" di"`) are
-  tokenized once and then copied. Per-thread, so it needs no lock.
 - **Incremental pair counts in `fit`**: update the counts around each merge instead of
   recounting every pair.
 - **Learn whitespace too**: let training see the whitespace pieces so that runs like `"\n\n"`
@@ -241,4 +298,4 @@ merges. Hugging Face tokenizers and SentencePiece train the same way.
 
 ## License
 
-GPL-3.0, see [LICENSE](LICENSE). `include/arena.h` is MIT, by Alexey Kutepov.
+GPL-3.0, see [LICENSE](LICENSE).
