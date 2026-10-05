@@ -65,18 +65,19 @@ static inline size_t hash_bytes(const void *data, size_t len)
 #define hash_table_clear(h)             (hashTableClear(hash_table__hdr(h)))
 
 // item must be an lvalue of type T. Returns false only if the table is full.
-#define hash_table_put(h, item)         (hashTablePut(hash_table__hdr(h), &((__typeof__(*h)[1])(item)),                     \
+#define hash_table_put(h, item)         (hashTablePut(hash_table__hdr(h), &((__typeof__(*h)[1]){item}),                     \
                                                       hash_table__koff(h), hash_table__ksize(h)))
 
-// Returns T* to the stored entry or NULL. A compound literal key needs extra parentheses:
+// Returns T* to the stored entry or NULL. k may be a struct variable (copied through a one element
+// array, like put); a compound literal key needs extra parentheses:
 // hash_table_get(m, ((Pair){1, 2})).
 #define hash_table_get(h, k)            ((__typeof__(h))hashTableGet(hash_table__hdr(h),               \
-                                                      &(__typeof__((h)->key)){k},                       \
+                                                      &((__typeof__((h)->key)[1]){k}),                       \
                                                       hash_table__koff(h), hash_table__ksize(h)))
 
 // Returns true if the key was present.
 #define hash_table_remove(h, k)         (hashTableRemove(hash_table__hdr(h),                           \
-                                                      &(__typeof__((h)->key)){k},                       \
+                                                      &((__typeof__((h)->key)[1]){k}),                       \
                                                       hash_table__koff(h), hash_table__ksize(h)))
 
 
