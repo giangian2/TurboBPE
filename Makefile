@@ -58,7 +58,33 @@ bin build out:
 memcheck: bin/main | out
 	valgrind --leak-check=full --track-origins=yes bin/main $(ARGS)
 
+# Benchmark of tokenize: BENCH_TEXT is repeated until it is BENCH_SIZE bytes long.
+# bin/bench is always built with -O2 straight from the sources, whatever OPT is: timing a -O0
+# build means nothing. -g stays, so callgrind can attribute the cost to functions and lines.
+#   make bench                                   time it
+#   make profile                                 callgrind, cost per function
+#   make bench BENCH_MODEL=out/model2.bpe BENCH_TEXT=test2.txt
+BENCH_MODEL ?= out/model.bpe
+BENCH_TEXT  ?= test.txt
+BENCH_SIZE  ?= 2000000
+# callgrind runs the program ~50x slower: a smaller text gives the same proportions
+PROFILE_SIZE ?= 300000
+CALLGRIND_OUT = build/callgrind.out
+
+bin/bench: src/bench.c $(SRC) $(HDR) | bin
+	$(CC) -std=c11 -Wall -Wextra -g -Iinclude -O2 src/bench.c $(SRC) $(LDLIBS) -o $@
+
+bench: bin/bench
+	./bin/bench $(BENCH_MODEL) $(BENCH_TEXT) $(BENCH_SIZE)
+
+# the full report, line by line too: callgrind_annotate --auto=yes build/callgrind.out
+# (or open it in kcachegrind)
+profile: bin/bench | build
+	valgrind --tool=callgrind --callgrind-out-file=$(CALLGRIND_OUT) \
+		./bin/bench $(BENCH_MODEL) $(BENCH_TEXT) $(PROFILE_SIZE)
+	callgrind_annotate --auto=no $(CALLGRIND_OUT) | tail -n +20
+
 clean:
 	rm -rf build bin out
 
-.PHONY: all run debug clean memcheck
+.PHONY: all run debug clean memcheck bench profile
