@@ -12,6 +12,8 @@
 #define PAIR_BITS 12
 #define PAIR_CAP  (1u << PAIR_BITS)      // 4096, must be a power of 2 (used as a bit mask)
 #define BPE_MAGIC "BPE1"                 // first 4 bytes of a model file, bump the digit if the format changes
+#define CACHE_MAX_LEN 15                 // longer pieces skip the word cache (rare, seldom repeated)
+#define CACHE_CAP (1u << 15)             // slots of the word cache, emptied when half full
 
 typedef uint16_t token_t; // 16 bits -> up to 65536 ids in the vocabulary
 
@@ -60,6 +62,23 @@ typedef struct {
     uint32_t n_tok;   // tokens produced, filled by tokenize_piece
 } Span;
 
+/**
+ * Word cache: piece bytes -> its tokens, so a word seen before is copied instead of merged again.
+ * It is a hashmap.h table of CacheEntry, created with bpe_cache_create. A piece has at most
+ * CACHE_MAX_LEN bytes and never more tokens than bytes, so every entry has a fixed size and lives
+ * entirely inside its slot. Not thread-safe: one cache per calling thread, the BPE stays shared.
+ */
+typedef struct {
+    uint8_t len;                     // bytes of the piece
+    uint8_t bytes[CACHE_MAX_LEN];    // the piece, zero padded: the key is compared with memcmp
+} CacheKey;
+
+typedef struct {
+    CacheKey key;
+    uint8_t  n_tok;
+    token_t  tokens[CACHE_MAX_LEN];
+} CacheEntry;
+
 
 
 // O(1) average: adds n to the count of pair (a, b) in the open addressing hashmap
@@ -74,8 +93,9 @@ void       init(char* corpus[], size_t corpus_len, Word* words, token_t* ids, si
 // Learns the merges until VOCAB_SIZE, MAX_MERGES or MERGES_THRESHOLD is reached
 void       fit(Word* words, token_t* ids, size_t n_words, BPE* bpe_state);
 
-// Encodes text into out (at least strlen(text) tokens), returns the number of tokens written
-size_t     tokenize(const char* text, token_t* out, BPE* bpe_state, Span* out_spans);
+// Encodes text into out (at least strlen(text) tokens), returns the number of tokens written.
+// cache comes from bpe_cache_create and is filled as it goes; NULL tokenizes without cache
+size_t     tokenize(const char* text, token_t* out, BPE* bpe_state, Span* out_spans, CacheEntry* cache);
 
 // Decodes n tokens into a NUL terminated string in out (cap bytes, terminator included)
 size_t     detokenize(const token_t* tokens, size_t n, char* out, size_t cap, BPE* bpe_state);
@@ -95,5 +115,11 @@ BPE*       bpe_init(void);
 
 // Releases a model created by bpe_init (NULL is allowed)
 void       bpe_free(BPE* bpe_state);
+
+// Allocates an empty word cache (CACHE_CAP slots) for tokenize. Returns NULL on error
+CacheEntry* bpe_cache_create(void);
+
+// Releases a cache created by bpe_cache_create (NULL is allowed)
+void       bpe_cache_free(CacheEntry* cache);
 
 #endif

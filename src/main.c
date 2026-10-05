@@ -128,9 +128,15 @@ static int live(const char* model_path)
     fprintf(stderr, "loaded %u merges from %s\n", bpe->n_merges, model_path);
 
     Arena*  a    = arena_create(1 << 20); // 1 MB: righe fino a ~70 KB
-    if (a == NULL)
+    // the word cache lives for the whole session, NOT in the arena: the arena is reset at every
+    // line and the cache would forget everything
+    CacheEntry* cache = bpe_cache_create();
+    if (a == NULL || cache == NULL)
     {
-        perror("arena_create");
+        perror("arena_create / bpe_cache_create");
+        if (a != NULL)
+            arena_free(a);
+        bpe_cache_free(cache);
         bpe_free(bpe);
         return 1;
     }
@@ -154,7 +160,7 @@ static int live(const char* model_path)
         }
         memcpy(text, line, n + 1);
 
-        size_t nt = tokenize(text, out, bpe, spans);
+        size_t nt = tokenize(text, out, bpe, spans, cache);
         printf("%zu bytes -> %zu tokens\n", (size_t)n, nt);
 
         // after the compaction the tokens of span i follow those of span i-1 in out: walk the
@@ -180,6 +186,7 @@ static int live(const char* model_path)
     }
 
     free(line);
+    bpe_cache_free(cache);
     arena_free(a);
     bpe_free(bpe);
     return 0;

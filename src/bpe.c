@@ -49,6 +49,17 @@ static size_t merge_hash(const void* key, size_t key_size)
     return (size_t)(x ^ (x >> 32));
 }
 
+// hash_func for the word cache: the 16 key bytes as two 64 bit halves, mixed like merge_hash
+static size_t cache_hash(const void* key, size_t key_size)
+{
+    (void)key_size; // always sizeof(CacheKey) == 16
+    uint64_t lo, hi;
+    memcpy(&lo, key, 8);
+    memcpy(&hi, (const uint8_t*)key + 8, 8);
+    uint64_t x = (lo ^ (hi * 0x9E3779B97F4A7C15ULL)) * 0xFF51AFD7ED558CCDULL;
+    return (size_t)(x ^ (x >> 32));
+}
+
 // Records (a, b) -> id in the merge map. Same key encoding as PairEntry
 static inline void merge_map_add(MergeEntry* map, token_t a, token_t b, token_t id)
 {
@@ -290,14 +301,48 @@ static size_t pretokenize(const uint8_t* text, size_t len, Span* spans)
 }
 
 /**
+ * tokenize_piece behind the word cache. bytes is the piece in the text, piece its slice of out
+ * (already one token per byte). Hit: the stored tokens are copied. Miss: the piece is merged as
+ * usual and the result stored; when the cache is half full it is emptied first, so the linear
+ * probing chains stay short. Pieces longer than CACHE_MAX_LEN bypass the cache.
+ */
+static uint32_t tokenize_piece_cached(const BPE* bpe, CacheEntry* cache, const uint8_t* bytes,
+                                      token_t* piece, uint32_t len)
+{
+    if (len > CACHE_MAX_LEN)
+        return tokenize_piece(bpe, piece, len);
+
+    CacheKey key = {0}; // the padding after len bytes must be zero: memcmp sees the whole key
+    key.len = (uint8_t)len;
+    memcpy(key.bytes, bytes, len);
+
+    const CacheEntry* hit = hash_table_get(cache, key);
+    if (hit != NULL)
+    {
+        memcpy(piece, hit->tokens, hit->n_tok * sizeof(token_t));
+        return hit->n_tok;
+    }
+
+    uint32_t n_tok = tokenize_piece(bpe, piece, len);
+
+    if (hash_table_count(cache) >= CACHE_CAP / 2)
+        hash_table_clear(cache);
+    CacheEntry e = {.key = key, .n_tok = (uint8_t)n_tok};
+    memcpy(e.tokens, piece, n_tok * sizeof(token_t));
+    hash_table_put(cache, e);
+    return n_tok;
+}
+
+/**
  * O(sum of len^2 over the pieces): encodes text into out, which must hold at least strlen(text) tokens, and
  * describes its pieces in spans (at least strlen(text) entries).
  * 1. out gets one token per byte, pretokenize splits the text into spans
- * 2. every piece is merged in place inside its own slice out[start .. start+len)
+ * 2. every piece is merged in place inside its own slice out[start .. start+len), or copied from
+ *    cache when it was seen before (cache may be NULL)
  * 3. compaction: the slices are moved one after the other, closing the gaps left by the merges
  * Returns the number of tokens, stored in out[0 .. return).
  */
-size_t tokenize(const char* text, token_t* out, BPE* bpe_state, Span* out_spans)
+size_t tokenize(const char* text, token_t* out, BPE* bpe_state, Span* out_spans, CacheEntry* cache)
 {
     const uint8_t* s   = (const uint8_t*)text; // unsigned: bytes >= 128 stay positive
     size_t       len = strlen(text);
@@ -310,7 +355,11 @@ size_t tokenize(const char* text, token_t* out, BPE* bpe_state, Span* out_spans)
 
     for (size_t i = 0; i < n_spans; i++)
     {
-        out_spans[i].n_tok = tokenize_piece(bpe_state, out + out_spans[i].start, out_spans[i].len);
+        token_t* piece = out + out_spans[i].start;
+        out_spans[i].n_tok =
+            cache != NULL
+                ? tokenize_piece_cached(bpe_state, cache, s + out_spans[i].start, piece, out_spans[i].len)
+                : tokenize_piece(bpe_state, piece, out_spans[i].len);
     }
 
     // compaction: w is where the next piece goes. w <= start always (every piece wrote at most
@@ -556,4 +605,20 @@ void bpe_free(BPE* bpe)
         return;
     hash_table_free(bpe->hashtable);
     free(bpe);
+}
+
+/**
+ * Allocates an empty word cache for tokenize: CACHE_CAP slots of CacheEntry (about 1.5 MB).
+ * Returns NULL on error. Release it with bpe_cache_free.
+ */
+CacheEntry* bpe_cache_create(void)
+{
+    return hash_table_create(CacheEntry, CACHE_CAP, cache_hash);
+}
+
+// Releases a cache created by bpe_cache_create. NULL is allowed, like free
+void bpe_cache_free(CacheEntry* cache)
+{
+    if (cache != NULL)
+        hash_table_free(cache);
 }
