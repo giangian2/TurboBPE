@@ -14,26 +14,32 @@ SRC = src/bpe.c
 HDR = $(wildcard include/*.h)
 OBJ = $(SRC:src/%.c=build/%.o)
 LIB = bin/libbpe.a
+SO  = bin/libbpe.so
 
 # Witness of the optimization level build/ was produced with: the file name
 # embeds it, so switching means it does not exist, the rule fires and throws
 # the stale objects away before recompiling.
 OPTSTAMP = build/.opt$(subst -,,$(OPT))
 
-all: $(LIB) bin/main
+all: $(LIB) $(SO) bin/main
 
-# the demo program, linked against the library
+# the demo program, linked against the static library by path: -lbpe would pick libbpe.so
 bin/main: src/main.c $(LIB) | bin
-	$(CC) $(CFLAGS) $< -Lbin -lbpe $(LDLIBS) -o $@
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
 $(LIB): $(OBJ) | bin
 	ar rcs $@ $^
+
+# shared library for Python (ctypes): compiled straight from the sources because the objects in
+# build/ are not position independent
+$(SO): $(SRC) $(HDR) $(OPTSTAMP) | bin
+	$(CC) $(CFLAGS) -fPIC -shared $(SRC) $(LDLIBS) -o $@
 
 build/%.o: src/%.c $(HDR) $(OPTSTAMP) | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OPTSTAMP): | build
-	rm -f build/*.o build/.opt* $(LIB)
+	rm -f build/*.o build/.opt* $(LIB) $(SO)
 	touch $@
 
 # arguments passed to bin/main by run/debug/memcheck, e.g. make run ARGS="live out/model.bpe"
