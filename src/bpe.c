@@ -9,6 +9,7 @@
 #include <unistd.h> // Per close (per chiudere il file descriptor)
 
 #include "turbo_bpe.h"
+#include "hashmap.h"
 
 // static Merge        merges[MAX_MERGES];
 static PairEntry pairs[PAIR_CAP];
@@ -37,6 +38,22 @@ static inline uint32_t pair_key_count(uint64_t k)
 static inline uint32_t pair_hash(uint32_t key)
 {
     return (key * 2654435761u) >> (32 - PAIR_BITS);
+}
+
+// hash_func for the merge map: the table uses the LOW bits, so the high half of the product is
+// folded down
+static size_t merge_hash(const void* key, size_t key_size)
+{
+    (void)key_size;
+    uint64_t x = *(const uint32_t*)key * 0x9E3779B97F4A7C15ULL;
+    return (size_t)(x ^ (x >> 32));
+}
+
+// Records (a, b) -> id in the merge map. Same key encoding as PairEntry
+static inline void merge_map_add(MergeEntry* map, token_t a, token_t b, token_t id)
+{
+    MergeEntry e = {.key = ((uint32_t)a << 16) | b, .id = id};
+    hash_table_put(map, e);
 }
 
 /**
@@ -195,6 +212,7 @@ void fit(Word* words, token_t* ids, size_t n_words, BPE* bpe_state)
         free(best);
 
         bpe_state->merges[bpe_state->n_merges++] = (Merge){a, b}; // new_id == 256 + (n_merges - 1)
+        merge_map_add(bpe_state->hashtable, a, b, new_id);
 
         for (size_t w = 0; w < n_words; w++)
             words[w].len = merge_pair_in_seq(ids + words[w].start, words[w].len, a, b, new_id);
@@ -208,11 +226,35 @@ static inline int is_separator(char c)
     return c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
+
+/**
+ * O(len^2): merges the piece in place and returns its new length. At every step looks up each
+ * adjacent pair in the merge map and applies the one learned first (lowest id) to the whole
+ * piece. Same result as replaying the merges in the order fit learned them, but it only visits
+ * the merges that actually occur in the piece instead of all n_merges.
+ */
 static uint32_t tokenize_piece(const BPE* bpe, token_t* piece, uint32_t len)
 {
-    for (uint32_t m = 0; m < bpe->n_merges && len > 1; m++)     // same order as fit
-        len = merge_pair_in_seq(piece, len, bpe->merges[m].left, bpe->merges[m].right,
-                                (token_t)(256 + m));
+    /**
+     * @todo We need to optimize the number of lookups in order to don't make a hash get
+     * for each pair, since we scan the same pair many times.
+     */
+    while (len > 1)
+    {
+        const MergeEntry* best = NULL;
+        for (uint32_t i = 0; i + 1 < len; i++)
+        {
+            const MergeEntry* e =
+                hash_table_get(bpe->hashtable, ((uint32_t)piece[i] << 16) | piece[i + 1]);
+            if (e != NULL && (best == NULL || e->id < best->id))
+                best = e;
+        }
+        if (best == NULL)
+            break; // no adjacent pair was ever merged: the piece is final
+
+        len = merge_pair_in_seq(piece, len, (token_t)(best->key >> 16), (token_t)best->key,
+                                (token_t)best->id);
+    }
     return len;
 }
 
@@ -248,7 +290,7 @@ static size_t pretokenize(const uint8_t* text, size_t len, Span* spans)
 }
 
 /**
- * O(len * n_merges): encodes text into out, which must hold at least strlen(text) tokens, and
+ * O(sum of len^2 over the pieces): encodes text into out, which must hold at least strlen(text) tokens, and
  * describes its pieces in spans (at least strlen(text) entries).
  * 1. out gets one token per byte, pretokenize splits the text into spans
  * 2. every piece is merged in place inside its own slice out[start .. start+len)
@@ -414,7 +456,8 @@ size_t parse_training_corpus(char* path, char*** words_out, char** words_pool_ou
 /**
  * Writes the learned merges to path: magic, n_merges, then the merges in the order they were
  * learned (the order is the model: token id 256 + i is merges[i]). Only the n_merges used entries
- * are written. Returns 0 on success, -1 on error.
+ * are written. The merge map is not saved: it holds a function pointer and its bucket layout,
+ * and bpe_load rebuilds it from the array. Returns 0 on success, -1 on error.
  */
 int bpe_save(const BPE* bpe_state, const char* path)
 {
@@ -440,7 +483,8 @@ int bpe_save(const BPE* bpe_state, const char* path)
 }
 
 /**
- * Reads a model written by bpe_save into bpe_state. Rejects files with a wrong magic, too many
+ * Reads a model written by bpe_save into bpe_state, which must come from bpe_init (its merge map
+ * is cleared and refilled). Rejects files with a wrong magic, too many
  * merges, or a merge whose children are not older tokens (that would break the DAG walked by
  * detokenize). Returns 0 on success, -1 on error.
  */
@@ -473,6 +517,43 @@ int bpe_load(BPE* bpe_state, const char* path)
             return -1;
         }
     }
+
+    // the map is derived data, not stored in the file: rebuilt from the array, merges[i] -> 256 + i
+    hash_table_clear(bpe_state->hashtable);
+    for (uint32_t i = 0; i < n; i++)
+        merge_map_add(bpe_state->hashtable, bpe_state->merges[i].left, bpe_state->merges[i].right,
+                      (token_t)(256 + i));
+
     bpe_state->n_merges = n;
     return 0;
+}
+
+/**
+ * Allocates an empty model on the heap (merges[] alone is 2 MB, too big for the stack) together
+ * with its merge map. Returns NULL on error. Release it with bpe_free.
+ */
+BPE* bpe_init(void)
+{
+    BPE* bpe = (BPE*)malloc(sizeof(BPE));
+    if (bpe == NULL)
+        return NULL;
+
+    // at most VOCAB_SIZE - 256 merges: 2 * VOCAB_SIZE keeps the load under 50%
+    bpe->hashtable = hash_table_create(MergeEntry, 2 * VOCAB_SIZE, merge_hash);
+    if (bpe->hashtable == NULL)
+    {
+        free(bpe);
+        return NULL;
+    }
+    bpe->n_merges = 0;
+    return bpe;
+}
+
+// Releases a model created by bpe_init. NULL is allowed, like free
+void bpe_free(BPE* bpe)
+{
+    if (bpe == NULL)
+        return;
+    hash_table_free(bpe->hashtable);
+    free(bpe);
 }

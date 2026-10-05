@@ -61,7 +61,7 @@ static int train(char* path, const char* model_path)
     for (size_t c = 0; c < corpus_len; c++)
         raw_size += strlen(corpus[c]);
 
-    bpe   = (BPE*)malloc(sizeof(BPE));
+    bpe   = bpe_init();
     ids   = (token_t*)malloc(sizeof(token_t) * raw_size);
     words = (Word*)malloc(sizeof(Word) * corpus_len);
     if (bpe == NULL || ids == NULL || words == NULL)
@@ -69,7 +69,6 @@ static int train(char* path, const char* model_path)
         perror("malloc");
         goto cleanup;
     }
-    bpe->n_merges = 0;
 
     size_t unique_words_count = 0;
     size_t unique_ids         = 0;
@@ -103,7 +102,7 @@ cleanup:
     free(words);
     free(corpus);
     free(text_pool);
-    free(bpe);
+    bpe_free(bpe);
     return rc;
 }
 
@@ -114,7 +113,7 @@ cleanup:
  */
 static int live(const char* model_path)
 {
-    BPE* bpe = (BPE*)malloc(sizeof(BPE));
+    BPE* bpe = bpe_init();
     if (bpe == NULL)
     {
         perror("malloc");
@@ -122,7 +121,7 @@ static int live(const char* model_path)
     }
     if (bpe_load(bpe, model_path) != 0)
     {
-        free(bpe);
+        bpe_free(bpe);
         return 1;
     }
 
@@ -132,7 +131,7 @@ static int live(const char* model_path)
     if (a == NULL)
     {
         perror("arena_create");
-        free(bpe);
+        bpe_free(bpe);
         return 1;
     }
     char*   line = NULL;
@@ -182,7 +181,7 @@ static int live(const char* model_path)
 
     free(line);
     arena_free(a);
-    free(bpe);
+    bpe_free(bpe);
     return 0;
 }
 

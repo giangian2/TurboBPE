@@ -38,8 +38,14 @@ typedef struct {
 } Merge;
 
 typedef struct {
-    Merge    merges[MAX_MERGES];
-    uint32_t n_merges;
+    uint32_t key;   // (a << 16) | b, stessa codifica di PairEntry
+    uint32_t id;    // token prodotto dal merge: 256 + rank
+} MergeEntry;
+
+typedef struct {
+    Merge       merges[MAX_MERGES];
+    uint32_t    n_merges;
+    MergeEntry* hashtable;
     // later: MergeEntry *rank_map;   (a,b) -> rank
 } BPE;
 
@@ -81,7 +87,13 @@ size_t     parse_training_corpus(char* path, char*** words_out, char** words_poo
 // Writes the learned merges to path (magic, n_merges, merges[n_merges]). Returns 0 or -1
 int        bpe_save(const BPE* bpe_state, const char* path);
 
-// Reads a model written by bpe_save, validating it. Returns 0 or -1
+// Reads a model written by bpe_save into a BPE from bpe_init, validating it. Returns 0 or -1
 int        bpe_load(BPE* bpe_state, const char* path);
+
+// Allocates an empty model and its merge map on the heap. Returns NULL on error
+BPE*       bpe_init(void);
+
+// Releases a model created by bpe_init (NULL is allowed)
+void       bpe_free(BPE* bpe_state);
 
 #endif
